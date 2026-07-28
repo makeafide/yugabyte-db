@@ -4,7 +4,6 @@ DIRS = \
 	orafce \
 	pg_cron \
 	pg_hint_plan \
-	pg_parquet \
 	pg_partman \
 	pg_stat_monitor \
 	pgaudit \
