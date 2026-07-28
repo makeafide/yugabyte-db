@@ -69,14 +69,30 @@ ybgistbeginscan(Relation rel, int nkeys, int norderbys)
 	/* YB spatial: ybctid de-dup set is created lazily on first fetch. */
 	((YbgistScanOpaque) so)->yb_seen_ctids = NULL;
 
+	/* YB spatial: range+probe request plan (filled at first exec). */
+	((YbgistScanOpaque) so)->yb_probes = NULL;
+	((YbgistScanOpaque) so)->yb_nprobes = 0;
+	((YbgistScanOpaque) so)->yb_span_lo = NULL;
+	((YbgistScanOpaque) so)->yb_span_hi = NULL;
+	((YbgistScanOpaque) so)->yb_nspans = 0;
+	((YbgistScanOpaque) so)->yb_total_reqs = 0;
+	((YbgistScanOpaque) so)->yb_next_req = 0;
+	((YbgistScanOpaque) so)->yb_legacy_bind = false;
+
 	scan->opaque = so;
 
 	return scan;
 }
 
+/*
+ * YB spatial: create a fresh DocDB select handle for this index scan and apply
+ * the pushdowns.  Called from ybgistrescan for the first request and from the
+ * range+probe scan path (ybgistget.c) for each subsequent request -- DocDB
+ * ANDs all conditions bound to one request, so every disjoint cell span needs
+ * its own request/handle.
+ */
 void
-ybgistrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
-			ScanKey orderbys, int norderbys)
+ybgistInitHandle(IndexScanDesc scan)
 {
 	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
 	YbcPgPrepareParameters prepare_params = {
@@ -86,10 +102,6 @@ ybgistrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 												scan->indexRelation),
 	};
 
-	/* Initialize non-yb gin scan opaque fields. */
-	ginrescan(scan, scankey, nscankeys, orderbys, norderbys);
-
-	/* Initialize ybgist scan opaque handle. */
 	HandleYBStatus(YBCPgNewSelect(YBCGetDatabaseOid(scan->heapRelation),
 								  YbGetRelfileNodeId(scan->heapRelation),
 								  &prepare_params,
@@ -97,6 +109,19 @@ ybgistrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 								  &ybso->handle));
 	YbApplyPrimaryPushdown(ybso->handle, scan->yb_rel_pushdown);
 	YbApplySecondaryIndexPushdown(ybso->handle, scan->yb_idx_pushdown);
+}
+
+void
+ybgistrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+			ScanKey orderbys, int norderbys)
+{
+	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
+
+	/* Initialize non-yb gin scan opaque fields. */
+	ginrescan(scan, scankey, nscankeys, orderbys, norderbys);
+
+	/* Initialize ybgist scan opaque handle. */
+	ybgistInitHandle(scan);
 
 	/* YB spatial: drop any de-dup set from a previous scan iteration. */
 	if (ybso->yb_seen_ctids != NULL)
@@ -104,6 +129,16 @@ ybgistrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		hash_destroy(ybso->yb_seen_ctids);
 		ybso->yb_seen_ctids = NULL;
 	}
+
+	/* YB spatial: reset the range+probe request plan. */
+	ybso->yb_probes = NULL;
+	ybso->yb_nprobes = 0;
+	ybso->yb_span_lo = NULL;
+	ybso->yb_span_hi = NULL;
+	ybso->yb_nspans = 0;
+	ybso->yb_total_reqs = 0;
+	ybso->yb_next_req = 0;
+	ybso->yb_legacy_bind = false;
 
 	/* Initialize ybgist scan opaque is_exec_done. */
 	ybso->is_exec_done = false;
