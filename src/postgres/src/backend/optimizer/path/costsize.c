@@ -160,6 +160,15 @@ double		yb_interzone_cost = YB_DEFAULT_INTERZONE_COST;
 double		yb_local_cost = YB_DEFAULT_LOCAL_COST;
 
 /*
+ * ybgist per-candidate recheck fetch cost model (see ybgistcostestimate):
+ * per_candidate = yb_network_fetch_cost * coef * reltuples^exp.
+ * Defaults fit to measured index-vs-seqscan crossovers at 1.75e5 and 1e7 rows;
+ * GUCs so multi-node/RF=3 recalibration needs no rebuild.
+ */
+double		yb_ybgist_recheck_fetch_coef = 0.0058;
+double		yb_ybgist_recheck_scale_exp = 0.33;
+
+/*
  * Following parameters are used in the newer cost model that aims to model the
  * pggate and DocDB storage layer and LSM index lookup more precisely.
  */

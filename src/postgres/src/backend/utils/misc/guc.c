@@ -6238,6 +6238,29 @@ static struct config_real ConfigureNamesReal[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"yb_ybgist_recheck_fetch_coef", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Coefficient of the ybgist per-candidate recheck "
+						 "fetch cost (times yb_network_fetch_cost times "
+						 "reltuples^yb_ybgist_recheck_scale_exp)."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&yb_ybgist_recheck_fetch_coef,
+		0.0058, 0, DBL_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"yb_ybgist_recheck_scale_exp", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Exponent applied to reltuples in the ybgist "
+						 "per-candidate recheck fetch cost."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&yb_ybgist_recheck_scale_exp,
+		0.33, 0, 1.0,
+		NULL, NULL, NULL
+	},
+	{
 		{"jit_above_cost", PGC_USERSET, QUERY_TUNING_COST,
 			gettext_noop("Perform JIT compilation if query is more expensive."),
 			gettext_noop("-1 disables JIT compilation."),
