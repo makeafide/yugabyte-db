@@ -51,9 +51,32 @@ typedef struct YbgistScanOpaqueData
 	 * their ybctid.  NULL until first use; reset on rescan.
 	 */
 	HTAB	   *yb_seen_ctids;
+
+	/*
+	 * YB spatial range+probe scan (S2 cell spans).  The query's covering cells
+	 * are turned into
+	 *   - descendant SPANS: each query cell's subtree is a contiguous id range
+	 *     [id - (2^s - 1), id + (2^s - 1)] (s = stop-bit position), coalesced
+	 *     when adjacent -- matched with one CondBetween request per span;
+	 *   - ancestor PROBES: the ids of every strict ancestor of every query
+	 *     cell, sorted+deduped -- matched with one CondIn request.
+	 * DocDB ANDs all conditions on a request, so each span/probe-set needs its
+	 * own select request; requests run sequentially within one index scan and
+	 * results are unioned via yb_seen_ctids.  yb_legacy_bind marks the
+	 * preserved single-request partial-match (prefix) path.
+	 */
+	Datum	   *yb_probes;		/* sorted unique ancestor cell ids */
+	int			yb_nprobes;
+	int64	   *yb_span_lo;		/* coalesced spans, ascending */
+	int64	   *yb_span_hi;
+	int			yb_nspans;
+	int			yb_total_reqs;	/* (yb_nprobes > 0) + yb_nspans, or 1 legacy */
+	int			yb_next_req;	/* next request index to start */
+	bool		yb_legacy_bind; /* partial-match path: binds pre-applied */
 } YbgistScanOpaqueData;
 
 typedef YbgistScanOpaqueData *YbgistScanOpaque;
 
 extern char *ybgistNullCategoryToString(GinNullCategory category);
 extern char *ybgistSearchModeToString(int32 searchMode);
+extern void ybgistInitHandle(IndexScanDesc scan);

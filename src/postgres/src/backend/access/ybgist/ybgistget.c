@@ -37,7 +37,6 @@
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 
-static int ybgistCmpInt64Datum(const void *a, const void *b);
 #include "nodes/makefuncs.h"
 #include "pg_yb_utils.h"
 #include "utils/builtins.h"
@@ -367,10 +366,68 @@ ybgistSetupBindsForPartialMatch(TupleDesc tupdesc, YbgistScanOpaque ybso,
 }
 
 /*
- * Add binds for the select.
+ * YB spatial cell-id bit math.  Mirrors the encoding in the ybgist opclass
+ * extension (ybgist_cells.h): a cell id is the Morton interleave of (i,j)
+ * shifted left with a trailing "stop" bit marking the level, so
+ *   - the stop bit is the lowest set bit;
+ *   - a cell's whole subtree (all strictly finer descendants plus itself)
+ *     occupies the contiguous id interval [id - (2^s - 1), id + (2^s - 1)]
+ *     where s is the stop-bit position;
+ *   - the parent cell clears the two finest Morton bits and moves the stop
+ *     bit up by two.
+ * Ancestor ids never fall inside a descendant span (their stop bit exceeds
+ * the span's half-width), so probes and spans are disjoint.
+ */
+static inline int
+ybgistCellStopShift(int64 id)
+{
+	Assert(id > 0);
+	return __builtin_ctzll((uint64) id);
+}
+
+/* id of the parent cell, or 0 if id is already the level-0 root */
+static inline int64
+ybgistCellParent(int64 id)
+{
+	int			s = ybgistCellStopShift(id);
+
+	if (s >= 60)				/* level 0: no parent */
+		return 0;
+	return (int64) (((uint64) id & ~((1ULL << (s + 3)) - 1)) |
+					(1ULL << (s + 2)));
+}
+
+static inline void
+ybgistCellSpan(int64 id, int64 *lo, int64 *hi)
+{
+	int64		half = ((int64) 1 << ybgistCellStopShift(id)) - 1;
+
+	*lo = id - half;
+	*hi = id + half;
+}
+
+static int
+ybgistCmpInt64(const void *a, const void *b)
+{
+	int64		lhs = *(const int64 *) a;
+	int64		rhs = *(const int64 *) b;
+
+	return (lhs > rhs) - (lhs < rhs);
+}
+
+/*
+ * Plan the DocDB select requests for a spatial range+probe scan.
+ *
+ * Every query entry (a covering cell id) contributes one descendant span and
+ * its chain of strict-ancestor probe ids.  Spans are sorted and coalesced when
+ * they touch; probes are sorted and de-duplicated.  Matching semantics: an
+ * indexed cell X overlaps a query cell Q iff X is in Q's subtree (span) or X
+ * is a strict ancestor of Q (probe) -- together with the executor's exact
+ * recheck this preserves GIN overlap semantics without requiring ancestors to
+ * be materialized in the index or the query covering.
  */
 static void
-ybgistSetupBinds(IndexScanDesc scan)
+ybgistPlanRequests(IndexScanDesc scan)
 {
 	GinScanEntry entry;
 	GinScanKey	key;
@@ -430,25 +487,26 @@ ybgistSetupBinds(IndexScanDesc scan)
 							   " non-normal null category: %s.",
 							   ybgistNullCategoryToString(entry->queryCategory))));
 		ybgistSetupBindsForPartialMatch(tupdesc, ybso, entry);
+		ybso->yb_legacy_bind = true;
+		ybso->yb_total_reqs = 1;
 	}
 	else
 	{
-		Oid			keytypid = TupleDescAttr(tupdesc, 0)->atttypid;
-		Oid			keycoll = so->ginstate.supportCollation[0];
-		YbcPgExpr	colref;
-		YbcPgExpr  *values;
+		MemoryContext scanCtx = GetMemoryChunkContext(ybso);
+		int64	   *lo;
+		int64	   *hi;
+		int64	   *probes;
+		int			nprobes = 0;
+		int			nspans = 0;
+		int			maxprobes = 0;
 		int			i;
 
 		/*
-		 * Bind ALL query entries (not just GIN's "required" subset).  For the
-		 * overlap semantics of a cell-covering spatial opclass a base row
-		 * matches if it shares ANY query cell, so every entry must be probed --
-		 * GIN's required/additional split (chosen by selectivity) would drop the
-		 * coarse ancestor cells that actually overlap coarser indexed geometries.
+		 * Turn EVERY query entry (not just GIN's "required" subset -- the
+		 * required/additional split is selectivity-driven and would drop
+		 * entries that overlap semantics need) into a descendant span plus
+		 * ancestor probes.
 		 */
-		Datum	   *keys = (Datum *) palloc(key->nentries * sizeof(Datum));
-
-		values = (YbcPgExpr *) palloc(key->nentries * sizeof(YbcPgExpr));
 		for (i = 0; i < key->nentries; i++)
 		{
 			entry = key->scanEntry[i];
@@ -461,32 +519,162 @@ ybgistSetupBinds(IndexScanDesc scan)
 						 errdetail("ybgist index method does not support"
 								   " non-normal null category: %s.",
 								   ybgistNullCategoryToString(entry->queryCategory))));
-			/* Partial match cannot be combined with an IN over many cells. */
+			/* Partial match cannot be combined with span/probe requests. */
 			if (entry->isPartialMatch)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("unsupported ybgist index scan"),
 						 errdetail("ybgist index method cannot combine partial"
-								   " match with multiple required entries.")));
-
-			keys[i] = entry->queryKey;
+								   " match with multiple entries.")));
+			/* ancestor-chain length == the cell's level == 30 - stopshift/2 */
+			maxprobes += 30 - ybgistCellStopShift((int64)
+												  DatumGetInt64(entry->queryKey)) / 2;
 		}
 
-		/*
-		 * The ybgist index key column is range-sorted (no hash column), and
-		 * YBCPgDmlBindColumnCondIn probes IN values in the given order -- so the
-		 * cell values must be sorted ascending, or matches for out-of-order
-		 * values are missed.
-		 */
-		qsort(keys, key->nentries, sizeof(Datum), ybgistCmpInt64Datum);
-		for (i = 0; i < key->nentries; i++)
-			values[i] = YBCNewConstant(ybso->handle, keytypid, keycoll,
-									   keys[i], false /* is_null */ );
+		lo = (int64 *) MemoryContextAlloc(scanCtx,
+										  key->nentries * sizeof(int64));
+		hi = (int64 *) MemoryContextAlloc(scanCtx,
+										  key->nentries * sizeof(int64));
+		probes = (int64 *) MemoryContextAlloc(scanCtx,
+											  Max(maxprobes, 1) * sizeof(int64));
 
+		for (i = 0; i < key->nentries; i++)
+		{
+			int64		id = DatumGetInt64(key->scanEntry[i]->queryKey);
+			int64		anc;
+
+			ybgistCellSpan(id, &lo[nspans], &hi[nspans]);
+			nspans++;
+			for (anc = ybgistCellParent(id); anc != 0;
+				 anc = ybgistCellParent(anc))
+				probes[nprobes++] = anc;
+		}
+		Assert(nprobes <= maxprobes);
+
+		/* sort + coalesce adjacent/overlapping spans */
+		{
+			typedef struct
+			{
+				int64		lo;
+				int64		hi;
+			} YbgistSpan;
+			YbgistSpan *spans = (YbgistSpan *)
+				MemoryContextAlloc(scanCtx, nspans * sizeof(YbgistSpan));
+			int			nmerged = 0;
+
+			for (i = 0; i < nspans; i++)
+			{
+				spans[i].lo = lo[i];
+				spans[i].hi = hi[i];
+			}
+			qsort(spans, nspans, sizeof(YbgistSpan), ybgistCmpInt64);
+
+			for (i = 0; i < nspans; i++)
+			{
+				if (nmerged > 0 && spans[i].lo <= hi[nmerged - 1] + 1)
+				{
+					if (spans[i].hi > hi[nmerged - 1])
+						hi[nmerged - 1] = spans[i].hi;
+				}
+				else
+				{
+					lo[nmerged] = spans[i].lo;
+					hi[nmerged] = spans[i].hi;
+					nmerged++;
+				}
+			}
+			nspans = nmerged;
+			pfree(spans);
+		}
+
+		/* sort + de-duplicate probes (ascending order is load-bearing for the
+		 * range-sorted index key column: YBCPgDmlBindColumnCondIn probes the
+		 * values in the given order) */
+		if (nprobes > 1)
+		{
+			int			nuniq = 1;
+
+			qsort(probes, nprobes, sizeof(int64), ybgistCmpInt64);
+			for (i = 1; i < nprobes; i++)
+				if (probes[i] != probes[nuniq - 1])
+					probes[nuniq++] = probes[i];
+			nprobes = nuniq;
+		}
+
+		ybso->yb_span_lo = lo;
+		ybso->yb_span_hi = hi;
+		ybso->yb_nspans = nspans;
+		ybso->yb_nprobes = nprobes;
+		ybso->yb_probes = (Datum *) probes;	/* int64 == Datum here */
+		StaticAssertStmt(sizeof(Datum) == sizeof(int64),
+						 "ybgist cell ids require 64-bit Datums");
+		ybso->yb_total_reqs = (nprobes > 0 ? 1 : 0) + nspans;
+
+		/*
+		 * Aggregate pushdown streams straight from one DocDB request and
+		 * bypasses the ybctid de-dup, so it cannot span multiple requests.
+		 * The planner should never choose it (ybgistmightrecheck => true);
+		 * fail loudly if it somehow does.
+		 */
+		if (scan->yb_aggrefs != NIL && ybso->yb_total_reqs > 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported ybgist index scan"),
+					 errdetail("ybgist aggregate pushdown cannot span"
+							   " multiple cell requests.")));
+	}
+}
+
+/*
+ * Bind the conditions of request number `req` onto the current handle:
+ * request 0 is the ancestor-probe IN (when there are probes); the rest are
+ * one CondBetween per coalesced descendant span (both bounds inclusive, so
+ * behavior does not depend on yb_pushdown_strict_inequality).
+ */
+static void
+ybgistBindRequest(IndexScanDesc scan, int req)
+{
+	GinScanOpaque so = (GinScanOpaque) scan->opaque;
+	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
+	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
+	Oid			keytypid = TupleDescAttr(tupdesc, 0)->atttypid;
+	Oid			keycoll = so->ginstate.supportCollation[0];
+	int			spanidx = req - (ybso->yb_nprobes > 0 ? 1 : 0);
+
+	if (ybso->yb_nprobes > 0 && req == 0)
+	{
+		YbcPgExpr	colref;
+		YbcPgExpr  *values;
+		int			i;
+
+		values = (YbcPgExpr *) palloc(ybso->yb_nprobes * sizeof(YbcPgExpr));
+		for (i = 0; i < ybso->yb_nprobes; i++)
+			values[i] = YBCNewConstant(ybso->handle, keytypid, keycoll,
+									   ybso->yb_probes[i], false /* is_null */ );
 		colref = YBCNewColumnRef(ybso->handle, 1 /* attr_num */ , keytypid,
 								 keycoll, NULL /* type_attrs */ );
 		HandleYBStatus(YBCPgDmlBindColumnCondIn(ybso->handle, colref,
-												key->nentries, values));
+												ybso->yb_nprobes, values));
+		pfree(values);
+	}
+	else
+	{
+		YbcPgExpr	lo_expr;
+		YbcPgExpr	hi_expr;
+
+		Assert(spanidx >= 0 && spanidx < ybso->yb_nspans);
+		lo_expr = YBCNewConstant(ybso->handle, keytypid, keycoll,
+								 Int64GetDatum(ybso->yb_span_lo[spanidx]),
+								 false /* is_null */ );
+		hi_expr = YBCNewConstant(ybso->handle, keytypid, keycoll,
+								 Int64GetDatum(ybso->yb_span_hi[spanidx]),
+								 false /* is_null */ );
+		HandleYBStatus(YBCPgDmlBindColumnCondBetween(ybso->handle,
+													 1 /* attr_num */ ,
+													 lo_expr,
+													 true /* start_inclusive */ ,
+													 hi_expr,
+													 true /* end_inclusive */ ));
 	}
 }
 
@@ -544,18 +732,42 @@ ybgistExecSelect(IndexScanDesc scan, ScanDirection dir)
 }
 
 /*
- * Prepare and request the initial execution of select to pggate.
+ * Start the next planned request: (re)create the handle if this is not the
+ * first request, bind its conditions, set targets, and execute.  The first
+ * request reuses the handle created by ybgistrescan (which, on the legacy
+ * partial-match path, already carries its binds).
  */
-static bool
-ybgistDoFirstExec(IndexScanDesc scan, ScanDirection dir)
+static void
+ybgistStartNextRequest(IndexScanDesc scan, ScanDirection dir)
 {
 	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
+	int			req = ybso->yb_next_req;
 
-	if (!ybgistGetScanKeys(scan))
-		return false;
+	Assert(req < ybso->yb_total_reqs);
 
-	/* binds */
-	ybgistSetupBinds(scan);
+	if (req > 0)
+	{
+		/*
+		 * DocDB ANDs every condition bound to one request, so each disjoint
+		 * span needs a fresh select request.  Drop the drained handle and
+		 * build a new one (pushdowns reapplied by ybgistInitHandle).
+		 *
+		 * CRITICAL: YBCPgNewSelect registers the statement in the CURRENT PG
+		 * memory context, and gettuple runs in a short-lived per-tuple
+		 * context -- a statement created there is freed when that context
+		 * resets, leaving ybso->handle dangling (SIGSEGV on the next fetch).
+		 * Create the replacement handle in the scan opaque's context, the
+		 * same lifetime the first handle got from ybgistrescan.
+		 */
+		MemoryContext oldctx = MemoryContextSwitchTo(GetMemoryChunkContext(ybso));
+
+		YBCPgDeleteStatement(ybso->handle);
+		ybgistInitHandle(scan);
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	if (!ybso->yb_legacy_bind)
+		ybgistBindRequest(scan, req);
 
 	/* targets */
 	if (scan->yb_aggrefs != NIL)
@@ -577,6 +789,27 @@ ybgistDoFirstExec(IndexScanDesc scan, ScanDirection dir)
 
 	/* execute select */
 	ybgistExecSelect(scan, dir);
+
+	ybso->yb_next_req = req + 1;
+}
+
+/*
+ * Prepare and request the initial execution of select to pggate.
+ */
+static bool
+ybgistDoFirstExec(IndexScanDesc scan, ScanDirection dir)
+{
+	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
+
+	if (!ybgistGetScanKeys(scan))
+		return false;
+
+	/* plan the span/probe requests (or apply the legacy prefix binds) */
+	ybgistPlanRequests(scan);
+	if (ybso->yb_total_reqs == 0)
+		return false;
+
+	ybgistStartNextRequest(scan, dir);
 
 	return true;
 }
@@ -629,15 +862,6 @@ ybgistFetchNextHeapTuple(IndexScanDesc scan)
  * row whose bbox spans several matched cells is fetched once per cell.  We key
  * a hash table by the ybctid bytes (variable length) via a pointer key.
  */
-static int
-ybgistCmpInt64Datum(const void *a, const void *b)
-{
-	int64		x = DatumGetInt64(*(const Datum *) a);
-	int64		y = DatumGetInt64(*(const Datum *) b);
-
-	return (x > y) - (x < y);
-}
-
 typedef struct YbgistCtidKey
 {
 	struct varlena *ctid;
@@ -745,27 +969,34 @@ ybgistgettuple(IndexScanDesc scan, ScanDirection dir)
 		 */
 		return ybc_getnext_aggslot(scan, ybso->handle, scan->xs_want_itup);
 	}
-	while (HeapTupleIsValid(tup = ybgistFetchNextHeapTuple(scan)))
+	for (;;)
 	{
-		/*
-		 * A multi-cell (IN) scan can return the same base row several times.
-		 * Skip rows already returned by this scan.
-		 */
-		if (ybgistTupleAlreadySeen(ybso, tup))
+		while (HeapTupleIsValid(tup = ybgistFetchNextHeapTuple(scan)))
 		{
-			heap_freetuple(tup);
-			continue;
+			/*
+			 * A row can match several probe cells/spans (and thus be returned
+			 * by more than one request).  Skip rows already returned by this
+			 * scan; the de-dup set persists across all requests.
+			 */
+			if (ybgistTupleAlreadySeen(ybso, tup))
+			{
+				heap_freetuple(tup);
+				continue;
+			}
+
+			scan->xs_hitup = tup;
+			scan->xs_hitupdesc = RelationGetDescr(scan->heapRelation);
+
+			/* TODO(jason): don't assume that recheck is needed. */
+			scan->xs_recheck = true;
+			return true;
 		}
 
-		scan->xs_hitup = tup;
-		scan->xs_hitupdesc = RelationGetDescr(scan->heapRelation);
-
-		/* TODO(jason): don't assume that recheck is needed. */
-		scan->xs_recheck = true;
-		return true;
+		/* current request drained; move on to the next span, if any */
+		if (ybso->yb_next_req >= ybso->yb_total_reqs)
+			return false;
+		ybgistStartNextRequest(scan, dir);
 	}
-
-	return false;
 }
 
 /*
