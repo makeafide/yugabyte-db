@@ -954,6 +954,10 @@
   proname => 'ybginhandler', provolatile => 'v',
   prorettype => 'index_am_handler', proargtypes => 'internal',
   prosrc => 'ybginhandler' },
+{ oid => '8122', descr => 'ybgist index access method handler',
+  proname => 'ybgisthandler', provolatile => 'v',
+  prorettype => 'index_am_handler', proargtypes => 'internal',
+  prosrc => 'ybgisthandler' },
 
 { oid => '338', descr => 'validate an operator class',
   proname => 'amvalidate', provolatile => 'v', prorettype => 'bool',

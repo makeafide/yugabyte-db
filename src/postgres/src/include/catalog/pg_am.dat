@@ -39,5 +39,8 @@
 { oid => '8021', oid_symbol => 'YBGIN_AM_OID',
   descr => 'Yugabyte GIN index access method',
   amname => 'ybgin', amhandler => 'ybginhandler', amtype => 'i' },
+{ oid => '8121', oid_symbol => 'YBGIST_AM_OID',
+  descr => 'Yugabyte GiST spatial index access method',
+  amname => 'ybgist', amhandler => 'ybgisthandler', amtype => 'i' },
 
 ]
