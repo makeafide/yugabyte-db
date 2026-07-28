@@ -47,14 +47,15 @@
  *     yb_network_fetch_cost * COEF * tuples^EXP
  * with COEF/EXP fit to the measured crossovers at 1.75e5 and 1e7 rows (it then
  * extrapolates: ~0.8% at 3e8).  Plus the recheck qual eval.  See
- * ybgistcostestimate.  NOTE: this still cannot correct broad queries that use
- * expensive PostGIS predicate *functions* (st_within/st_contains/st_intersects
- * carry procost=5000, inflating the seqscan estimate so the index is preferred
- * past its real crossover); mitigate with the raw && operator or
- * enable_indexscan=off for such near-full-scan queries.
+ * ybgistcostestimate.  COEF/EXP are the GUCs yb_ybgist_recheck_fetch_coef /
+ * yb_ybgist_recheck_scale_exp (costsize.c) so recalibration on different
+ * topologies (RF=3, multi-node) needs no rebuild.  NOTE: this still cannot
+ * correct broad queries that use expensive PostGIS predicate *functions*
+ * (st_within/st_contains/st_intersects carry procost=5000, inflating the
+ * seqscan estimate so the index is preferred past its real crossover);
+ * mitigate with the raw && operator or enable_indexscan=off for such
+ * near-full-scan queries.
  */
-#define YBGIST_RECHECK_FETCH_COEF  0.0058
-#define YBGIST_RECHECK_SCALE_EXP   0.33
 
 void
 ybgistcostestimate(struct PlannerInfo *root, struct IndexPath *path,
@@ -93,8 +94,8 @@ ybgistcostestimate(struct PlannerInfo *root, struct IndexPath *path,
 	if (candidates > 0.0 && baserel_tuples > 1.0)
 	{
 		double		per_cand_fetch = yb_network_fetch_cost *
-			YBGIST_RECHECK_FETCH_COEF *
-			pow(baserel_tuples, YBGIST_RECHECK_SCALE_EXP);
+			yb_ybgist_recheck_fetch_coef *
+			pow(baserel_tuples, yb_ybgist_recheck_scale_exp);
 
 		*indexTotalCost += candidates *
 			(per_cand_fetch + cpu_tuple_cost + qual_cost.per_tuple);
