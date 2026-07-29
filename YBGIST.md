@@ -43,6 +43,8 @@ the git-diff build stamp.
 
 Correctness idx==seq across a 157-case predicate matrix at 175k/10M rows (spot-verified at
 100M), edge geometries (globe-spanning, antimeridian, poles, empty/degenerate), UPDATE/DELETE
-churn, concurrent online backfill; RF=3: full matrix re-pass plus node-kill during
+churn, concurrent online backfill; multi-scan-key scans (several indexable quals on one geom
+column — e.g. explicit `&&` plus the support-fn-derived `~` from `ST_Covers`) bind the
+tightest key and recheck the rest; RF=3: full matrix re-pass plus node-kill during
 queries/backfill, tablet auto-splits, and restart recovery — all green. Details:
 [yb-pggist docs/ybgist-changelist.md](https://github.com/makeafide/yb-pggist/blob/main/docs/ybgist-changelist.md).
