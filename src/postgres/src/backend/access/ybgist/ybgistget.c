@@ -484,70 +484,108 @@ ybgistPlanRequests(IndexScanDesc scan)
 	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
 
 	/*
-	 * Multiple scan keys arise even without multicolumn support when the same
-	 * column carries several indexable quals -- most commonly PostGIS's
+	 * Partition the scan keys by attribute.  The LAST key column is the
+	 * spatial one (ybgistCheckShape); keys on leading columns are plain
+	 * equalities (their opclasses register only strategy 3 "="), bound
+	 * verbatim onto every request.  Among the SPATIAL keys -- several arise
+	 * when one geom column carries multiple indexable quals, e.g. PostGIS's
 	 * support function deriving "geom ~ X" alongside an explicit
-	 * "geom && X" (e.g. ST_Covers(geom, pt) AND geom && pt).  ybgist always
-	 * forces executor recheck of every original index qual
-	 * (ybgistmightrecheck => true; gettuple sets xs_recheck unconditionally),
-	 * so it is sufficient to bind ONE key's cell covering to DocDB and let
-	 * the recheck enforce the rest: unbound keys only lose candidate
-	 * pruning, never filtering.  Pick the bindable key with the tightest
-	 * covering (smallest total descendant-span width) to minimize fetched
-	 * candidates.  If xs_recheck ever becomes conditional this selection is
-	 * no longer correct.
+	 * "geom && X" -- bind only the tightest covering: ybgist always forces
+	 * executor recheck of every original index qual (ybgistmightrecheck =>
+	 * true; gettuple sets xs_recheck unconditionally), so unbound keys only
+	 * lose candidate pruning, never filtering.  No spatial key at all
+	 * (leading-column-only query) means an unconstrained scan of the
+	 * equality prefix.  If xs_recheck ever becomes conditional this
+	 * dropping is no longer correct.
 	 */
-	if (so->nkeys == 1)
-		key = &so->keys[0];
-	else
 	{
+		MemoryContext eqCtx = GetMemoryChunkContext(ybso);
+		int			natts = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
 		int64		bestwidth = 0;
+		int			nspatial = 0;
 		int			k;
+
+		ybso->yb_neq = 0;
+		ybso->yb_eq_attno = (AttrNumber *)
+			MemoryContextAlloc(eqCtx, so->nkeys * sizeof(AttrNumber));
+		ybso->yb_eq_value = (Datum *)
+			MemoryContextAlloc(eqCtx, so->nkeys * sizeof(Datum));
 
 		key = NULL;
 		for (k = 0; k < so->nkeys; k++)
 		{
 			GinScanKey	cand = &so->keys[k];
-			bool		bindable = (cand->searchMode == GIN_SEARCH_MODE_DEFAULT);
-			int64		width = 0;
-			int			e;
 
-			for (e = 0; bindable && e < cand->nentries; e++)
+			if (cand->attnum < natts)
 			{
-				GinScanEntry cent = cand->scanEntry[e];
+				/* leading column: must be a simple single-entry equality */
+				if (cand->searchMode != GIN_SEARCH_MODE_DEFAULT ||
+					cand->nentries != 1 ||
+					cand->scanEntry[0]->queryCategory != GIN_CAT_NORM_KEY ||
+					cand->scanEntry[0]->isPartialMatch)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("unsupported ybgist index scan"),
+							 errdetail("ybgist leading index columns support"
+									   " only simple equality conditions.")));
+				ybso->yb_eq_attno[ybso->yb_neq] = cand->attnum;
+				ybso->yb_eq_value[ybso->yb_neq] = cand->scanEntry[0]->queryKey;
+				ybso->yb_neq++;
+				continue;
+			}
 
-				if (cent->queryCategory != GIN_CAT_NORM_KEY ||
-					cent->isPartialMatch)
-					bindable = false;
-				else
+			nspatial++;
+			if (nspatial == 1 && so->nkeys == 1)
+			{
+				/* sole key: preserve legacy paths (incl. partial match) */
+				key = cand;
+				continue;
+			}
+
+			/* several spatial keys: pick the tightest bindable covering */
+			{
+				bool		bindable = (cand->searchMode == GIN_SEARCH_MODE_DEFAULT);
+				int64		width = 0;
+				int			e;
+
+				for (e = 0; bindable && e < cand->nentries; e++)
 				{
-					int			s = ybgistCellStopShift(
-									DatumGetInt64(cent->queryKey));
+					GinScanEntry cent = cand->scanEntry[e];
 
-					/* subtree span covers 2^(s+1) - 1 cell ids */
-					width += ((int64) 2 << s) - 1;
+					if (cent->queryCategory != GIN_CAT_NORM_KEY ||
+						cent->isPartialMatch)
+						bindable = false;
+					else
+					{
+						int			s = ybgistCellStopShift(
+										DatumGetInt64(cent->queryKey));
+
+						/* subtree span covers 2^(s+1) - 1 cell ids */
+						width += ((int64) 2 << s) - 1;
+					}
+				}
+				if (bindable && (key == NULL || width < bestwidth))
+				{
+					key = cand;
+					bestwidth = width;
 				}
 			}
-			if (bindable && (key == NULL || width < bestwidth))
-			{
-				key = cand;
-				bestwidth = width;
-			}
 		}
-		if (key == NULL)
+
+		if (key == NULL && nspatial > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("unsupported ybgist index scan"),
-					 errdetail("ybgist index method found no bindable scan"
-							   " key among %d.", so->nkeys),
+					 errdetail("ybgist index method found no bindable spatial"
+							   " scan key among %d.", nspatial),
 					 errhint("Consider rewriting the query with INTERSECT and"
 							 " UNION.")));
 	}
 
 	/*
-	 * For now, only handle the default search mode.
+	 * For now, only handle the default search mode (spatial key present).
 	 */
-	if (key->searchMode != GIN_SEARCH_MODE_DEFAULT)
+	if (key != NULL && key->searchMode != GIN_SEARCH_MODE_DEFAULT)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("unsupported ybgist index scan"),
@@ -569,7 +607,31 @@ ybgistPlanRequests(IndexScanDesc scan)
 	 *
 	 * The single-entry partial-match path (prefix scans) is preserved as-is.
 	 */
-	if (key->nrequired == 1 && key->requiredEntries[0]->isPartialMatch)
+	if (key == NULL)
+	{
+		/*
+		 * Leading-column-only query: no spatial constraint -- one request
+		 * scanning the whole equality prefix (the eq binds are applied by
+		 * ybgistBindRequest).  NULL/empty-category rows are included since
+		 * no condition is bound on the cell column.
+		 */
+		ybso->yb_nspans = 0;
+		ybso->yb_nprobes = 0;
+		ybso->yb_total_reqs = 1;
+
+		/*
+		 * A multi-cell row appears once per cell and only the ybctid de-dup
+		 * collapses it; aggregate pushdown would bypass that.
+		 */
+		if (scan->yb_aggrefs != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported ybgist index scan"),
+					 errdetail("ybgist aggregate pushdown requires a spatial"
+							   " index condition.")));
+	}
+	else if (key->nrequired == 1 && key->requiredEntries[0]->isPartialMatch &&
+			 IndexRelationGetNumberOfKeyAttributes(scan->indexRelation) == 1)
 	{
 		entry = key->requiredEntries[0];
 		if (entry->queryCategory != GIN_CAT_NORM_KEY)
@@ -742,9 +804,28 @@ ybgistBindRequest(IndexScanDesc scan, int req)
 	GinScanOpaque so = (GinScanOpaque) scan->opaque;
 	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
 	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
-	Oid			keytypid = TupleDescAttr(tupdesc, 0)->atttypid;
-	Oid			keycoll = so->ginstate.supportCollation[0];
+	int			natts = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
+	Oid			keytypid = TupleDescAttr(tupdesc, natts - 1)->atttypid;
+	Oid			keycoll = so->ginstate.supportCollation[natts - 1];
 	int			spanidx = req - (ybso->yb_nprobes > 0 ? 1 : 0);
+	int			e;
+
+	/* leading-column equality binds, replayed on every request's handle */
+	for (e = 0; e < ybso->yb_neq; e++)
+	{
+		AttrNumber	attno = ybso->yb_eq_attno[e];
+		Oid			eqtypid = TupleDescAttr(tupdesc, attno - 1)->atttypid;
+		Oid			eqcoll = so->ginstate.supportCollation[attno - 1];
+		YbcPgExpr	eqexpr = YBCNewConstant(ybso->handle, eqtypid, eqcoll,
+											ybso->yb_eq_value[e],
+											false /* is_null */ );
+
+		HandleYBStatus(YBCPgDmlBindColumn(ybso->handle, attno, eqexpr));
+	}
+
+	/* leading-only scan: nothing spatial to bind */
+	if (ybso->yb_nspans == 0 && ybso->yb_nprobes == 0)
+		return;
 
 	if (ybso->yb_nprobes > 0 && req == 0)
 	{
@@ -756,8 +837,8 @@ ybgistBindRequest(IndexScanDesc scan, int req)
 		for (i = 0; i < ybso->yb_nprobes; i++)
 			values[i] = YBCNewConstant(ybso->handle, keytypid, keycoll,
 									   ybso->yb_probes[i], false /* is_null */ );
-		colref = YBCNewColumnRef(ybso->handle, 1 /* attr_num */ , keytypid,
-								 keycoll, NULL /* type_attrs */ );
+		colref = YBCNewColumnRef(ybso->handle, natts /* spatial attr_num */ ,
+								 keytypid, keycoll, NULL /* type_attrs */ );
 		HandleYBStatus(YBCPgDmlBindColumnCondIn(ybso->handle, colref,
 												ybso->yb_nprobes, values));
 		pfree(values);
@@ -775,7 +856,7 @@ ybgistBindRequest(IndexScanDesc scan, int req)
 								 Int64GetDatum(ybso->yb_span_hi[spanidx]),
 								 false /* is_null */ );
 		HandleYBStatus(YBCPgDmlBindColumnCondBetween(ybso->handle,
-													 1 /* attr_num */ ,
+													 natts /* spatial attr_num */ ,
 													 lo_expr,
 													 true /* start_inclusive */ ,
 													 hi_expr,

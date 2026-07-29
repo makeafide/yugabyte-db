@@ -52,6 +52,8 @@ ybgistbeginscan(Relation rel, int nkeys, int norderbys)
 	/* no order by operators allowed */
 	Assert(norderbys == 0);
 
+	ybgistCheckShape(rel);
+
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
 	/* allocate private workspace */
@@ -78,6 +80,9 @@ ybgistbeginscan(Relation rel, int nkeys, int norderbys)
 	((YbgistScanOpaque) so)->yb_total_reqs = 0;
 	((YbgistScanOpaque) so)->yb_next_req = 0;
 	((YbgistScanOpaque) so)->yb_legacy_bind = false;
+	((YbgistScanOpaque) so)->yb_neq = 0;
+	((YbgistScanOpaque) so)->yb_eq_attno = NULL;
+	((YbgistScanOpaque) so)->yb_eq_value = NULL;
 
 	scan->opaque = so;
 
@@ -139,6 +144,9 @@ ybgistrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	ybso->yb_total_reqs = 0;
 	ybso->yb_next_req = 0;
 	ybso->yb_legacy_bind = false;
+	ybso->yb_neq = 0;
+	ybso->yb_eq_attno = NULL;
+	ybso->yb_eq_value = NULL;
 
 	/* Initialize ybgist scan opaque is_exec_done. */
 	ybso->is_exec_done = false;
