@@ -77,6 +77,7 @@ typedef struct YbgistScanOpaqueData
 
 typedef YbgistScanOpaqueData *YbgistScanOpaque;
 
-extern char *ybgistNullCategoryToString(GinNullCategory category);
-extern char *ybgistSearchModeToString(int32 searchMode);
+extern const char *ybgistNullCategoryToString(GinNullCategory category);
+extern const char *ybgistSearchModeToString(int32 searchMode);
 extern void ybgistInitHandle(IndexScanDesc scan);
+extern int	ybgistEstimateRequests(const int64 *ids, int n);

@@ -162,11 +162,21 @@ double		yb_local_cost = YB_DEFAULT_LOCAL_COST;
 /*
  * ybgist per-candidate recheck fetch cost model (see ybgistcostestimate):
  * per_candidate = yb_network_fetch_cost * coef * reltuples^exp.
- * Defaults fit to measured index-vs-seqscan crossovers at 1.75e5 and 1e7 rows;
- * GUCs so multi-node/RF=3 recalibration needs no rebuild.
+ * Defaults fit to measured index-vs-seqscan crossovers at 2e5 and 1e7 rows on
+ * an RF=3 cluster with cover-only (r2) indexes -- break-even per-candidate
+ * measured 2.16 cost units at 2e5 and 11.7 at 1e7; GUCs so different
+ * topologies can recalibrate without rebuilds.
  */
-double		yb_ybgist_recheck_fetch_coef = 0.0058;
-double		yb_ybgist_recheck_scale_exp = 0.33;
+double		yb_ybgist_recheck_fetch_coef = 0.0028;
+double		yb_ybgist_recheck_scale_exp = 0.43;
+
+/*
+ * Cost of each ADDITIONAL sequential DocDB request a ybgist scan must issue
+ * beyond the first: a query covering of N coalesced cell spans (plus an
+ * ancestor-probe batch) executes as N+1 round trips (see ybgistPlanRequests).
+ * Modeled as a flat per-request charge in units of yb_network_fetch_cost.
+ */
+double		yb_ybgist_request_cost = YB_DEFAULT_FETCH_COST;
 
 /*
  * Following parameters are used in the newer cost model that aims to model the

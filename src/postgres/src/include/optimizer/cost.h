@@ -129,6 +129,7 @@ extern PGDLLIMPORT int constraint_exclusion;
 extern PGDLLIMPORT double yb_network_fetch_cost;
 extern PGDLLIMPORT double yb_ybgist_recheck_fetch_coef;
 extern PGDLLIMPORT double yb_ybgist_recheck_scale_exp;
+extern PGDLLIMPORT double yb_ybgist_request_cost;
 extern PGDLLIMPORT double yb_intercloud_cost;
 extern PGDLLIMPORT double yb_interregion_cost;
 extern PGDLLIMPORT double yb_interzone_cost;
