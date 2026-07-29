@@ -436,20 +436,65 @@ ybgistPlanRequests(IndexScanDesc scan)
 	YbgistScanOpaque ybso = (YbgistScanOpaque) scan->opaque;
 
 	/*
-	 * For now, only handle single-key scans.  Multiple keys are possible even
-	 * if multicolumn is disabled by specifiying the same column in multiple
-	 * conditions (e.g. v @@ 'abc' and v @@ 'bcd').
+	 * Multiple scan keys arise even without multicolumn support when the same
+	 * column carries several indexable quals -- most commonly PostGIS's
+	 * support function deriving "geom ~ X" alongside an explicit
+	 * "geom && X" (e.g. ST_Covers(geom, pt) AND geom && pt).  ybgist always
+	 * forces executor recheck of every original index qual
+	 * (ybgistmightrecheck => true; gettuple sets xs_recheck unconditionally),
+	 * so it is sufficient to bind ONE key's cell covering to DocDB and let
+	 * the recheck enforce the rest: unbound keys only lose candidate
+	 * pruning, never filtering.  Pick the bindable key with the tightest
+	 * covering (smallest total descendant-span width) to minimize fetched
+	 * candidates.  If xs_recheck ever becomes conditional this selection is
+	 * no longer correct.
 	 */
-	if (so->nkeys != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("unsupported ybgist index scan"),
-				 errdetail("ybgist index method cannot use"
-						   " more than one scan key: got %d.",
-						   so->nkeys),
-				 errhint("Consider rewriting the query with INTERSECT and"
-						 " UNION.")));
-	key = &so->keys[0];
+	if (so->nkeys == 1)
+		key = &so->keys[0];
+	else
+	{
+		int64		bestwidth = 0;
+		int			k;
+
+		key = NULL;
+		for (k = 0; k < so->nkeys; k++)
+		{
+			GinScanKey	cand = &so->keys[k];
+			bool		bindable = (cand->searchMode == GIN_SEARCH_MODE_DEFAULT);
+			int64		width = 0;
+			int			e;
+
+			for (e = 0; bindable && e < cand->nentries; e++)
+			{
+				GinScanEntry cent = cand->scanEntry[e];
+
+				if (cent->queryCategory != GIN_CAT_NORM_KEY ||
+					cent->isPartialMatch)
+					bindable = false;
+				else
+				{
+					int			s = ybgistCellStopShift(
+									DatumGetInt64(cent->queryKey));
+
+					/* subtree span covers 2^(s+1) - 1 cell ids */
+					width += ((int64) 2 << s) - 1;
+				}
+			}
+			if (bindable && (key == NULL || width < bestwidth))
+			{
+				key = cand;
+				bestwidth = width;
+			}
+		}
+		if (key == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported ybgist index scan"),
+					 errdetail("ybgist index method found no bindable scan"
+							   " key among %d.", so->nkeys),
+					 errhint("Consider rewriting the query with INTERSECT and"
+							 " UNION.")));
+	}
 
 	/*
 	 * For now, only handle the default search mode.
@@ -614,14 +659,17 @@ ybgistPlanRequests(IndexScanDesc scan)
 		 * Aggregate pushdown streams straight from one DocDB request and
 		 * bypasses the ybctid de-dup, so it cannot span multiple requests.
 		 * The planner should never choose it (ybgistmightrecheck => true);
-		 * fail loudly if it somehow does.
+		 * fail loudly if it somehow does.  Likewise it cannot be combined
+		 * with multiple scan keys, where dropped keys are enforced only by
+		 * the executor recheck that pushdown bypasses.
 		 */
-		if (scan->yb_aggrefs != NIL && ybso->yb_total_reqs > 1)
+		if (scan->yb_aggrefs != NIL &&
+			(ybso->yb_total_reqs > 1 || so->nkeys > 1))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("unsupported ybgist index scan"),
 					 errdetail("ybgist aggregate pushdown cannot span"
-							   " multiple cell requests.")));
+							   " multiple cell requests or scan keys.")));
 	}
 }
 
