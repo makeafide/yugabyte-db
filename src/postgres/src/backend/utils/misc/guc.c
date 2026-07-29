@@ -6246,7 +6246,7 @@ static struct config_real ConfigureNamesReal[] =
 			GUC_EXPLAIN
 		},
 		&yb_ybgist_recheck_fetch_coef,
-		0.0058, 0, DBL_MAX,
+		0.0028, 0, DBL_MAX,
 		NULL, NULL, NULL
 	},
 	{
@@ -6257,7 +6257,18 @@ static struct config_real ConfigureNamesReal[] =
 			GUC_EXPLAIN
 		},
 		&yb_ybgist_recheck_scale_exp,
-		0.33, 0, 1.0,
+		0.43, 0, 1.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"yb_ybgist_request_cost", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Cost of each additional sequential DocDB request "
+						 "issued by a multi-span ybgist index scan."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&yb_ybgist_request_cost,
+		YB_DEFAULT_FETCH_COST, 0, DBL_MAX,
 		NULL, NULL, NULL
 	},
 	{

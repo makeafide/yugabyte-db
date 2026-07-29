@@ -416,6 +416,54 @@ ybgistCmpInt64(const void *a, const void *b)
 }
 
 /*
+ * Estimate how many sequential DocDB requests a scan over the given query
+ * covering (cell ids) will issue: one per coalesced descendant span plus one
+ * for the ancestor-probe batch when any cell has ancestors.  Mirrors the
+ * request planning in ybgistPlanRequests; used by ybgistcostestimate to
+ * charge yb_ybgist_request_cost per additional request.
+ */
+int
+ybgistEstimateRequests(const int64 *ids, int n)
+{
+	int64	   *lo;
+	int64	   *hi;
+	int			nspans = 0;
+	bool		haveprobes = false;
+	int			i;
+
+	if (n <= 0)
+		return 1;
+
+	lo = (int64 *) palloc(n * sizeof(int64));
+	hi = (int64 *) palloc(n * sizeof(int64));
+	for (i = 0; i < n; i++)
+	{
+		ybgistCellSpan(ids[i], &lo[i], &hi[i]);
+		if (ybgistCellParent(ids[i]) != 0)
+			haveprobes = true;
+	}
+	qsort(lo, n, sizeof(int64), ybgistCmpInt64);
+	qsort(hi, n, sizeof(int64), ybgistCmpInt64);
+
+	/*
+	 * With both bounds sorted, spans coalesce exactly when the next lo starts
+	 * within (or adjacent to, or one-id-gapped from) the running merged hi --
+	 * same rule as the scan planner (spans from a common quadtree never
+	 * partially overlap after sorting, so pairing sorted lows with sorted
+	 * highs is order-preserving).
+	 */
+	for (i = 0; i < n; i++)
+	{
+		if (i > 0 && lo[i] <= hi[i - 1] + 2)
+			continue;
+		nspans++;
+	}
+	pfree(lo);
+	pfree(hi);
+	return nspans + (haveprobes ? 1 : 0);
+}
+
+/*
  * Plan the DocDB select requests for a spatial range+probe scan.
  *
  * Every query entry (a covering cell id) contributes one descendant span and
@@ -614,9 +662,18 @@ ybgistPlanRequests(IndexScanDesc scan)
 			}
 			qsort(spans, nspans, sizeof(YbgistSpan), ybgistCmpInt64);
 
+			/*
+			 * Coalesce spans that touch OR are separated by a single id: in
+			 * the stop-bit encoding the one id between two sibling subtree
+			 * spans is their common ancestor, which is a correct match anyway
+			 * (it is in the probe set) -- absorbing it merges e.g. the four
+			 * children of one parent into a single span and saves whole DocDB
+			 * round trips.  Widening a query span can only add candidates;
+			 * the executor recheck removes them.
+			 */
 			for (i = 0; i < nspans; i++)
 			{
-				if (nmerged > 0 && spans[i].lo <= hi[nmerged - 1] + 1)
+				if (nmerged > 0 && spans[i].lo <= hi[nmerged - 1] + 2)
 				{
 					if (spans[i].hi > hi[nmerged - 1])
 						hi[nmerged - 1] = spans[i].hi;

@@ -26,15 +26,18 @@
 
 #include <math.h>
 
+#include "access/genam.h"
 #include "access/gin_private.h"
 #include "access/relation.h"
 #include "access/reloptions.h"
+#include "access/ybgist_private.h"
 #include "commands/yb_cmds.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "utils/index_selfuncs.h"
+#include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 
 /*
@@ -45,16 +48,16 @@
  * index-vs-seqscan crossover selectivity fell from ~8% to ~2%.  A fixed fraction
  * cannot track that, so model the per-candidate fetch as
  *     yb_network_fetch_cost * COEF * tuples^EXP
- * with COEF/EXP fit to the measured crossovers at 1.75e5 and 1e7 rows (it then
- * extrapolates: ~0.8% at 3e8).  Plus the recheck qual eval.  See
+ * with COEF/EXP fit to the measured crossovers at 2e5 and 1e7 rows on RF=3
+ * with cover-only (r2) indexes.  Plus the recheck qual eval.  See
  * ybgistcostestimate.  COEF/EXP are the GUCs yb_ybgist_recheck_fetch_coef /
  * yb_ybgist_recheck_scale_exp (costsize.c) so recalibration on different
- * topologies (RF=3, multi-node) needs no rebuild.  NOTE: this still cannot
- * correct broad queries that use expensive PostGIS predicate *functions*
- * (st_within/st_contains/st_intersects carry procost=5000, inflating the
- * seqscan estimate so the index is preferred past its real crossover);
- * mitigate with the raw && operator or enable_indexscan=off for such
- * near-full-scan queries.
+ * topologies needs no rebuild.  Broad queries phrased with PostGIS predicate
+ * *functions* additionally need realistic procosts (PostGIS ships 5000,
+ * ~100-1000x above measured) -- apply ybgist_tune_costs() from the ybgist
+ * extension, else the inflated seqscan estimate keeps the index preferred
+ * past its real crossover.  A multi-span covering's extra round trips are
+ * charged separately via yb_ybgist_request_cost below.
  */
 
 void
@@ -99,6 +102,91 @@ ybgistcostestimate(struct PlannerInfo *root, struct IndexPath *path,
 
 		*indexTotalCost += candidates *
 			(per_cand_fetch + cpu_tuple_cost + qual_cost.per_tuple);
+	}
+
+	/*
+	 * Charge the sequential round trips of a multi-span scan: a query
+	 * covering of N coalesced cell spans (plus an ancestor-probe batch)
+	 * executes as N+1 DocDB requests, one after another (ybgistPlanRequests).
+	 * Estimate the request count by running the opclass extractQuery support
+	 * function on the first constant index qual -- the same covering the scan
+	 * itself will use.  Parameterized quals are skipped (unknown at plan
+	 * time); the scan binds a single key, so the first constant clause is
+	 * representative.
+	 */
+	{
+		ListCell   *lc;
+		bool		charged = false;
+
+		foreach(lc, path->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			ListCell   *lc2;
+
+			foreach(lc2, iclause->indexquals)
+			{
+				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+				OpExpr	   *clause;
+				Node	   *operand;
+				Relation	indexRel;
+				FmgrInfo   *extractProc;
+				Oid			collation;
+				StrategyNumber strategy;
+				Datum	   *entries;
+				int32		nentries = 0;
+				bool	   *partial_matches = NULL;
+				Pointer	   *extra_data = NULL;
+				bool	   *null_flags = NULL;
+				int32		searchMode = GIN_SEARCH_MODE_DEFAULT;
+				int			nreqs;
+
+				if (!IsA(rinfo->clause, OpExpr))
+					continue;
+				clause = (OpExpr *) rinfo->clause;
+				if (list_length(clause->args) != 2)
+					continue;
+				operand = (Node *) lsecond(clause->args);
+				if (IsA(operand, RelabelType))
+					operand = (Node *) ((RelabelType *) operand)->arg;
+				if (!IsA(operand, Const) || ((Const *) operand)->constisnull)
+					continue;
+
+				indexRel = index_open(path->indexinfo->indexoid,
+									  AccessShareLock);
+				extractProc = index_getprocinfo(indexRel, iclause->indexcol + 1,
+												GIN_EXTRACTQUERY_PROC);
+				collation = indexRel->rd_indcollation[iclause->indexcol];
+				strategy = get_op_opfamily_strategy(clause->opno,
+													indexRel->rd_opfamily[iclause->indexcol]);
+				entries = (Datum *)
+					DatumGetPointer(FunctionCall7Coll(extractProc,
+													  collation,
+													  ((Const *) operand)->constvalue,
+													  PointerGetDatum(&nentries),
+													  UInt16GetDatum(strategy),
+													  PointerGetDatum(&partial_matches),
+													  PointerGetDatum(&extra_data),
+													  PointerGetDatum(&null_flags),
+													  PointerGetDatum(&searchMode)));
+				index_close(indexRel, AccessShareLock);
+
+				if (entries != NULL && nentries > 0 &&
+					searchMode == GIN_SEARCH_MODE_DEFAULT &&
+					partial_matches == NULL)
+				{
+					StaticAssertStmt(sizeof(Datum) == sizeof(int64),
+									 "ybgist cell ids require 64-bit Datums");
+					nreqs = ybgistEstimateRequests((const int64 *) entries,
+												   (int) nentries);
+					if (nreqs > 1)
+						*indexTotalCost += (nreqs - 1) * yb_ybgist_request_cost;
+				}
+				charged = true;
+				break;
+			}
+			if (charged)
+				break;
+		}
 	}
 }
 
