@@ -73,6 +73,15 @@ typedef struct YbgistScanOpaqueData
 	int			yb_total_reqs;	/* (yb_nprobes > 0) + yb_nspans, or 1 legacy */
 	int			yb_next_req;	/* next request index to start */
 	bool		yb_legacy_bind; /* partial-match path: binds pre-applied */
+
+	/*
+	 * Multicolumn: equality binds for the leading (non-spatial) key columns,
+	 * replayed onto EVERY per-request handle.  The spatial column is always
+	 * the LAST key column (enforced by ybgistCheckShape).
+	 */
+	int			yb_neq;
+	AttrNumber *yb_eq_attno;
+	Datum	   *yb_eq_value;
 } YbgistScanOpaqueData;
 
 typedef YbgistScanOpaqueData *YbgistScanOpaque;
@@ -81,3 +90,4 @@ extern const char *ybgistNullCategoryToString(GinNullCategory category);
 extern const char *ybgistSearchModeToString(int32 searchMode);
 extern void ybgistInitHandle(IndexScanDesc scan);
 extern int	ybgistEstimateRequests(const int64 *ids, int n);
+extern void ybgistCheckShape(Relation index);

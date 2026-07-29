@@ -190,6 +190,45 @@ ybgistcostestimate(struct PlannerInfo *root, struct IndexPath *path,
 	}
 }
 
+/*
+ * Enforce the supported multicolumn shape: N leading SCALAR equality columns
+ * plus exactly one trailing SPATIAL (cell-covering) column.  A spatial
+ * opclass is recognized by being type-changing (opcintype geometry/box/
+ * geography -> STORAGE int8 cell ids), while the scalar equality opclasses
+ * are type-preserving.  The scan and write paths treat the LAST key column
+ * as the cell column, so a spatial column anywhere else would silently
+ * produce garbage spans (false negatives) -- hence a hard error here.
+ * Called from build, write, and beginscan entry points (cheap).
+ */
+void
+ybgistCheckShape(Relation index)
+{
+	TupleDesc	tupdesc = RelationGetDescr(index);
+	int			natts = IndexRelationGetNumberOfKeyAttributes(index);
+	int			i;
+
+	for (i = 0; i < natts; i++)
+	{
+		bool		typechanging = (index->rd_opcintype[i] !=
+									TupleDescAttr(tupdesc, i)->atttypid);
+
+		if (i == natts - 1 && !typechanging)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported ybgist index shape"),
+					 errdetail("The last column of a ybgist index must use a"
+							   " cell-covering (spatial) operator class.")));
+		if (i < natts - 1 && typechanging)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported ybgist index shape"),
+					 errdetail("The cell-covering (spatial) column must be the"
+							   " LAST ybgist index column; leading columns"
+							   " must use scalar equality operator"
+							   " classes.")));
+	}
+}
+
 bytea *
 ybgistoptions(Datum reloptions, bool validate)
 {

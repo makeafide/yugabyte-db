@@ -105,78 +105,67 @@ doBindsForIdxWrite(YbcPgStatement stmt,
 }
 
 /*
- * Extract entries and write values.
+ * Write one base row's index entries.
  *
- * The first part here is identical to first part of ginHeapTupleInsert.
+ * Multicolumn shape (ybgistCheckShape): the LAST key column is the spatial
+ * one; its extracted cells fan out into one DocDB index row each, while the
+ * leading scalar columns are replicated verbatim into every emitted row --
+ * a composite (lead1, ..., cell, basectid) range key.  NULL/empty spatial
+ * values become one GIN null-category row (isnull cell), so the row stays
+ * reachable by leading-column-only scans.
  */
 static int32
-ybgistTupleWrite(GinState *ginstate, OffsetNumber attnum,
-				Relation index, Datum value, bool isNull,
-				Datum ybctid, uint64_t *backfilltime,
-				bool isinsert)
+ybgistRowWrite(GinState *ginstate, Relation index,
+			   Datum *values, bool *isnull,
+			   Datum ybctid, uint64_t *backfilltime,
+			   bool isinsert)
 {
+	int			natts = ginstate->origTupdesc->natts;
+	OffsetNumber spatialatt = (OffsetNumber) natts;
 	Datum	   *entries;
 	GinNullCategory *categories;
+	Datum	   *rowvals;
+	bool	   *rownull;
 	int32		i,
 				nentries;
 
-	entries = ginExtractEntries(ginstate, attnum, value, isNull,
+	entries = ginExtractEntries(ginstate, spatialatt,
+								values[natts - 1], isnull[natts - 1],
 								&nentries, &categories);
 
-	/* Make sure that this is a single-column index. */
-	Assert(RelationGetNumberOfAttributes(index) == 1);
+	rowvals = (Datum *) palloc(natts * sizeof(Datum));
+	rownull = (bool *) palloc(natts * sizeof(bool));
+	for (i = 0; i < natts - 1; i++)
+	{
+		rowvals[i] = values[i];
+		rownull[i] = isnull[i];
+	}
 
 	for (i = 0; i < nentries; i++)
 	{
-		bool		isnull = categories[i] != 0;
-
 		/*
 		 * Pass the null category down using the spot where the data usually
 		 * goes.
 		 */
-		if (categories[i] != GIN_CAT_NORM_KEY)
-			entries[i] = categories[i];
+		rowvals[natts - 1] = (categories[i] != GIN_CAT_NORM_KEY)
+			? categories[i] : entries[i];
+		rownull[natts - 1] = categories[i] != 0;
 
-		/* Assume single-column index for parameters values and isnull. */
 		if (isinsert)
-			YBCExecuteInsertIndex(index, &entries[i], &isnull, ybctid,
+			YBCExecuteInsertIndex(index, rowvals, rownull, ybctid,
 								  backfilltime /* backfill_write_time */ ,
 								  doBindsForIdxWrite, (void *) ginstate);
 		else
 		{
 			Assert(!backfilltime);
-			YBCExecuteDeleteIndex(index, &entries[i], &isnull, ybctid,
+			YBCExecuteDeleteIndex(index, rowvals, rownull, ybctid,
 								  doBindsForIdxWrite, (void *) ginstate);
 		}
 	}
 
+	pfree(rowvals);
+	pfree(rownull);
 	return nentries;
-}
-
-/*
- * Insert index entries for a single indexable item during "normal"
- * (non-fast-update) insertion
- */
-static int32
-ybgistTupleInsert(GinState *ginstate, OffsetNumber attnum,
-				 Relation index, Datum value, bool isNull,
-				 Datum ybctid, uint64_t *backfilltime)
-{
-	return ybgistTupleWrite(ginstate, attnum, index, value, isNull, ybctid,
-						   backfilltime, true /* isinsert */ );
-}
-
-/*
- * Delete index entries for a single indexable item during "normal"
- * (non-fast-update) insertion
- */
-static int32
-ybgistTupleDelete(GinState *ginstate, OffsetNumber attnum,
-				 Relation index, Datum value, bool isNull,
-				 Datum ybctid)
-{
-	return ybgistTupleWrite(ginstate, attnum, index, value, isNull, ybctid,
-						   NULL /* backfilltime */ , false /* isinsert */ );
 }
 
 /*
@@ -190,17 +179,11 @@ ybgistBuildCallback(Relation index, Datum ybctid, Datum *values,
 	YbgistBuildState *buildstate = (YbgistBuildState *) state;
 	GinState   *ginstate = &buildstate->ginstate;
 	MemoryContext oldCtx;
-	int			i;
-	int32		nentries = 0;
 
 	oldCtx = MemoryContextSwitchTo(buildstate->funcCtx);
-	for (i = 0; i < ginstate->origTupdesc->natts; i++)
-		nentries += ybgistTupleInsert(ginstate, (OffsetNumber) (i + 1),
-									 index, values[i], isnull[i],
-									 ybctid,
-									 buildstate->backfilltime);
-
-	buildstate->indtuples += nentries;
+	buildstate->indtuples += ybgistRowWrite(ginstate, index, values, isnull,
+											ybctid, buildstate->backfilltime,
+											true /* isinsert */ );
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->funcCtx);
@@ -232,6 +215,7 @@ ybgistBuildCommon(Relation heap, Relation index, struct IndexInfo *indexInfo,
 	 */
 	if (!IsBinaryUpgrade)
 	{
+		ybgistCheckShape(index);
 		initGinState(&buildstate.ginstate, index);
 		if (bfinfo)
 			buildstate.backfilltime = &bfinfo->read_time;
@@ -318,11 +302,11 @@ ybgistWrite(Relation index, Datum *values, bool *isnull, Datum ybctid,
 	GinState   *ginstate = (GinState *) indexInfo->ii_AmCache;
 	MemoryContext oldCtx;
 	MemoryContext writeCtx;
-	int			i;
 
 	/* Initialize GinState cache if first call in this statement */
 	if (ginstate == NULL)
 	{
+		ybgistCheckShape(index);
 		oldCtx = MemoryContextSwitchTo(indexInfo->ii_Context);
 		ginstate = (GinState *) palloc(sizeof(GinState));
 		initGinState(ginstate, index);
@@ -336,20 +320,12 @@ ybgistWrite(Relation index, Datum *values, bool *isnull, Datum ybctid,
 
 	oldCtx = MemoryContextSwitchTo(writeCtx);
 
-	if (GinGetUseFastUpdate(index))
-		ereport(DEBUG2,
-				(errmsg("fast update is not yet supported for ybgist")));
-	for (i = 0; i < ginstate->origTupdesc->natts; i++)
-	{
-		if (isinsert)
-			ybgistTupleInsert(ginstate, (OffsetNumber) (i + 1),
-							 index, values[i], isnull[i],
-							 ybctid, NULL /* backfilltime */ );
-		else
-			ybgistTupleDelete(ginstate, (OffsetNumber) (i + 1),
-							 index, values[i], isnull[i],
-							 ybctid);
-	}
+	/*
+	 * No GinGetUseFastUpdate check: ybgist has no reloptions (ybgistoptions
+	 * always returns NULL) and the macro's Assert rejects the ybgist AM oid.
+	 */
+	ybgistRowWrite(ginstate, index, values, isnull, ybctid,
+				   NULL /* backfilltime */ , isinsert);
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextDelete(writeCtx);

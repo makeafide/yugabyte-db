@@ -158,6 +158,21 @@ UnsafeStatus HandleDifferentEntryType(
     }
     return CallNextDecoder<kMatchedId, kLastColumn>(input, end, row, index, chain);
   }
+  if (entry_type == KeyEntryType::kGinNull) {
+    // GIN null-category marker ('v' + one category byte).  Written by the
+    // ybgin/ybgist index write path for NULL/empty extracted values; surface
+    // it as a plain SQL NULL so unconstrained (e.g. leading-column-only
+    // multicolumn ybgist) scans can decode such index rows.
+    if (input >= end) {
+      return STATUS_FORMAT(
+          Corruption, "Not enough bytes to decode $0", entry_type).UnsafeRelease();
+    }
+    ++input;  // skip the category byte
+    if (kMatchedId) {
+      row->SetNull(index);
+    }
+    return CallNextDecoder<kMatchedId, kLastColumn>(input, end, row, index, chain);
+  }
   return STATUS_FORMAT(
       Corruption, "Wrong key entry type $0 expected but $1 found", kEntryType, entry_type)
       .UnsafeRelease();

@@ -46,7 +46,8 @@ ybgisthandler(PG_FUNCTION_ARGS)
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;	/* TODO(jason): support multicolumn */
+	amroutine->amcanmulticol = true;	/* leading equality cols + trailing
+										 * spatial col (ybgistCheckShape) */
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
