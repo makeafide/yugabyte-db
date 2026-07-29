@@ -24,7 +24,12 @@ build pipeline, tests, docs, and releases — lives in
   registration. Because these live in the initdb sys-catalog snapshot, a stock YB release can
   never load ybgist; distributions must be built from this branch.
 - `optimizer/path/costsize.c`, `utils/misc/guc.c`, `include/optimizer/cost.h` — cost GUCs
-  `yb_ybgist_recheck_fetch_coef` (0.0058) / `yb_ybgist_recheck_scale_exp` (0.33).
+  `yb_ybgist_recheck_fetch_coef` (0.0028) / `yb_ybgist_recheck_scale_exp` (0.43) /
+  `yb_ybgist_request_cost` (per additional DocDB request of a multi-span scan).
+- Multicolumn: `amcanmulticol` — N leading scalar equality columns + one trailing spatial
+  column (`USING ybgist(tenant_id, geom)`), shape-enforced by `ybgistCheckShape`.
+- `dockv/pg_key_decoder.cc` — decode `kGinNull` key entries as SQL NULL (required for
+  unconstrained multicolumn index scans over GIN null-category rows).
 - `third-party-extensions/Makefile` — local build workaround (skips pg_parquet); not for
   upstreaming.
 
@@ -45,6 +50,9 @@ Correctness idx==seq across a 157-case predicate matrix at 175k/10M rows (spot-v
 100M), edge geometries (globe-spanning, antimeridian, poles, empty/degenerate), UPDATE/DELETE
 churn, concurrent online backfill; multi-scan-key scans (several indexable quals on one geom
 column — e.g. explicit `&&` plus the support-fn-derived `~` from `ST_Covers`) bind the
-tightest key and recheck the rest; RF=3: full matrix re-pass plus node-kill during
-queries/backfill, tablet auto-splits, and restart recovery — all green. Details:
+tightest key and recheck the rest; multicolumn (tenant equality prefix + spatial), geography
+opclass, opt-in sphere-cube mapping (property-tested conservative coverings), and a
+measured/refit cost model (crossover matrix 14/14 in both raw-`&&` and predicate-function
+phrasings); RF=3: full matrix re-pass plus node-kill during queries/backfill, tablet
+auto-splits, and restart recovery — all green. Details:
 [yb-pggist docs/ybgist-changelist.md](https://github.com/makeafide/yb-pggist/blob/main/docs/ybgist-changelist.md).
