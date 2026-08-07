@@ -1,6 +1,6 @@
 # ybgist branch — native spatial index AM for YSQL
 
-This branch (`ybgist/2025.2.5.1`, based on upstream tag 2025.2.5.1) adds **ybgist**, a
+This branch (`ybgist/2025.2.6.0`, based on upstream branch 2025.2 at 2025.2.6.0) adds **ybgist**, a
 native spatial index access method for YugabyteDB: PostGIS geometries/geographies are
 decomposed into S2-style hierarchical cell ids stored in a distributed DocDB index table and
 scanned with range+probe matching (descendant-span `BETWEEN` requests + ancestor `IN`
@@ -28,7 +28,7 @@ system-catalog snapshot, so clusters must be initialized from a build of this br
   — core build one-liner:
 
   ```sh
-  YB_LINKING_TYPE=dynamic ./yb_build.sh release --no-tests -j "$(nproc)"
+  YB_LINKING_TYPE=dynamic ./yb_build.sh release --no-tests --skip-extra-pg-extensions -j "$(nproc)"
   ```
 
 - **Usage, configuration, and the operational runbook** (per-database setup, tuning GUCs,
@@ -41,7 +41,12 @@ Build notes for this branch:
 - after editing ybgist C files, `rm build/latest/postgres_build/build_stamp` to defeat the
   git-diff build stamp;
 - packaging with `yb_release`: stage any foreign geo `.so`s out of
-  `build/latest/postgres/lib` first (the packager rejects their libc++ rpaths).
+  `build/latest/postgres/lib` first (the packager rejects their libc++ rpaths);
+- `--skip-extra-pg-extensions` skips documentdb and pg_parquet, which this branch does not
+  use and which have historically broken local release builds. It is upstream's own flag
+  (`YB_SKIP_EXTRA_PG_EXTENSIONS`), so the branch carries no patch to
+  `third-party-extensions/Makefile`; it does not change the `-D` set the geo stack is
+  compiled against (`YB_ENABLE_YSQL_DOCUMENTDB_EXT` is set unconditionally in `CMakeLists.txt`).
 
 ## What this branch changes
 
@@ -51,7 +56,6 @@ Build notes for this branch:
 | Catalog | `src/include/catalog/pg_am.dat` (8121), `pg_proc.dat` (8122) | AM registration (fork-distribution model — see above) |
 | Cost model | `optimizer/path/costsize.c`, `utils/misc/guc.c`, `include/optimizer/cost.h` | GUCs `yb_ybgist_recheck_fetch_coef` (0.0028) / `yb_ybgist_recheck_scale_exp` (0.43), fit to measured crossovers at 2e5/1e7 rows; `yb_ybgist_request_cost` — each additional DocDB request of a multi-span scan, estimated at plan time via the opclass extractQuery |
 | DocDB | `src/yb/dockv/pg_key_decoder.cc` | decode `kGinNull` key entries as SQL NULL (required for unconstrained multicolumn scans over GIN null-category rows) |
-| Local build workaround | `third-party-extensions/Makefile` | skips pg_parquet; not for upstreaming |
 
 ## Validation summary
 
